@@ -623,7 +623,15 @@ function matchExtUrl(text, i, dTail, links) {
     while (k < n && isDigit(text[k])) k++;
     if (k > j + 1) j = k;
   }
-  if (text[j] === '/' || text[j] === '?' || text[j] === '#') {
+  // A '\' right after the domain is part of the URL too (doc-40:
+  // 'www.flux.com\' + newline links 'www.flux.com\' with href
+  // 'http://www.flux.com%5C'; the '\' is consumed by the URL, so no
+  // hard break follows). The scan loop below already consumes '\' as
+  // a generic path char; it just needs to be entered. A '.' after the
+  // domain also enters the scan (doc-40: 'http://sub.domain.example.
+  // io..\'); a purely trailing '.' is still stripped by trimExtUrl,
+  // so gfm-624 ('www.commonmark.org.') is unaffected.
+  if (text[j] === '/' || text[j] === '?' || text[j] === '#' || text[j] === '\\' || text[j] === '.') {
     while (j < n) {
       const c = text[j];
       if (isWs(c) || c === '<' || c === '>' || c === '[') break;
