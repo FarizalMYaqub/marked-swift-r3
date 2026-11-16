@@ -1787,9 +1787,14 @@ function parseList(lines, i, b, ctx, firstMarker) {
       // of the item's paragraph (cm-290, cm-291), if the paragraph is open,
       // no blank line intervenes, and the line starts no interrupting block.
       // Merge it into the previous line so the inner parse reads it as
-      // paragraph text, never as a new block.
+      // paragraph text, never as a new block. A line indented 4+ columns
+      // loses the 4-column code indent (cm-291); a smaller indent is kept
+      // as-is, so its leading spaces are part of the paragraph text
+      // (doc-06/22/26: '\n <img', '\n   Naïve', '\n  Inline' keep theirs).
+      // (Same rule as a lazy blockquote continuation.)
       if (paraOpen && trailingBlanks === 0 && isSetextLine(l) === 0 && !canInterruptParagraph(l)) {
-        itemLines[itemLines.length - 1] += '\n' + stripIndent(l, contentIndent);
+        const lazy = indentOf(l)[0] >= 4 ? stripIndent(l, 4) : l;
+        itemLines[itemLines.length - 1] += '\n' + lazy;
         trailingBlanks = 0;
         k++;
         continue;
