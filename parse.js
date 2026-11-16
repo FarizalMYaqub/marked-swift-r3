@@ -445,15 +445,131 @@ function parseDomainLabel(text, j) {
 
 // Trim the end of an extended autolink URL: unbalanced ')', an &...; entity
 // tail, then trailing punctuation. Repeats until stable.
+// Scan a label body starting at i, up to `end` (exclusive). A ']' closes
+// the current group (returns the position just past it) unless this is
+// the top level, where a bare ']' is invalid (returns -1). Nested '['
+// groups are scanned recursively, so balanced brackets nest to any depth
+// (cm-512/528: '[link [foo [bar]]]' is a valid label). Returns `end` when
+// the top-level body is consumed cleanly, or -1 when invalid / unclosed.
+function scanLabelBody(text, i, end, topLevel) {
+  while (i < end) {
+    const c = text[i];
+    if (c === '\\') {
+      if (i + 1 >= end) return -1;
+      i += 2;
+    } else if (c === '[') {
+      const close = scanLabelBody(text, i + 1, end, false);
+      if (close < 0) return -1;
+      i = close;
+    } else if (c === ']') {
+      return topLevel ? -1 : i + 1;
+    } else if (c === '`') {
+      // Code span `+[^`]*`+ (opening and closing run lengths need NOT
+      // match; content may be empty). The opening run is greedy, then
+      // backtracks: '``url`' is a code span (opening 2 + content 'url'
+      // + closing 1).
+      let r = i;
+      while (r < end && text[r] === '`') r++;
+      const runLen = r - i;
+      let matched = false;
+      for (let o = runLen; o >= 1 && !matched; o--) {
+        let m = i + o;
+        while (m < end && text[m] !== '`') m++;
+        if (m < end) {
+          let e = m;
+          while (e < end && text[e] === '`') e++;
+          i = e;
+          matched = true;
+        }
+      }
+      if (!matched) return -1;
+    } else {
+      i++;
+    }
+  }
+  return topLevel ? end : -1;
+}
+
+// Validate a link label against marked's label grammar: balanced nested
+// [...], backslash escapes, code spans `+[^`]*`+, or any char except '[',
+// ']', '\\', '`'. Returns false when any backtick cannot be consumed as
+// part of a code span (doc-16/18/20/23: a trailing lone run makes the
+// whole label invalid, so no link forms).
+function validLabel(text, a, b) {
+  return scanLabelBody(text, a, b, true) === b;
+}
+
+// Does the ']' at text[j] close a link? Finds the nearest active '['
+// delimiter (mirroring the ']' handler's opener search: a blocked opener
+// makes the ']' literal, an inactive opener is skipped for an earlier
+// one), validates the label, and checks the continuation (inline, full
+// reference, or shortcut) exactly the way tryLink resolves a destination.
+// Returns the opener, or null when no link closes here.
+function linkClosesAt(text, j, dTail, links) {
+  let opener = dTail;
+  while (opener && opener.ch !== '[') opener = opener.dprev;
+  if (!opener) return null;
+  if (opener.blocked) return null;
+  if (!opener.active) {
+    let o2 = opener.dprev;
+    while (o2 && !(o2.ch === '[' && o2.active && !o2.blocked)) o2 = o2.dprev;
+    if (!o2) return null;
+    opener = o2;
+  }
+  if (!validLabel(text, opener.src + 1, j)) return null;
+  const n = text.length;
+  let dest = false;
+  if (text[j + 1] === '(') {
+    const d = parseDest(text, j + 2);
+    if (d) {
+      let p = d.next;
+      while (p < n && (text[p] === ' ' || text[p] === '\t' || text[p] === '\n')) p++;
+      if (text[p] === ')') dest = true;
+      else {
+        const t = parseTitle(text, d.next);
+        if (t) {
+          let r = t.next;
+          while (r < n && (text[r] === ' ' || text[r] === '\t' || text[r] === '\n')) r++;
+          if (text[r] === ')') dest = true;
+        }
+      }
+    }
+  }
+  if (!dest && text[j + 1] === '[') {
+    const lab = parseLabel(text, j + 2);
+    if (lab) {
+      let key;
+      if (lab.label === '') key = normalizeLabel(text.slice(opener.src + 1, j));
+      else key = normalizeLabel(lab.label);
+      if (links.get(key)) dest = true;
+    }
+    if (!dest) return null;
+  }
+  if (!dest) {
+    const key = normalizeLabel(text.slice(opener.src + 1, j));
+    if (key !== '' && links.get(key)) dest = true;
+  }
+  return dest ? opener : null;
+}
+
 function trimExtUrl(url) {
   for (;;) {
     let changed = false;
-    let open = 0, close = 0;
-    for (let k = 0; k < url.length; k++) {
-      if (url[k] === '(') open++;
-      else if (url[k] === ')') close++;
+    // Strip a trailing ')' only when it is unmatched (no earlier '(' pairs
+    // with it). A matched trailing ')' is kept (doc-12:
+    // 'https://img.shields.io?q=stable&page=4)](./docs/create.md)' keeps
+    // its final ')', while gfm-625 'www.google.com/search?q=Markup+
+    // (business)))' loses its two extra unmatched ')').
+    while (url.endsWith(')')) {
+      let depth = 0;
+      for (let k = 0; k < url.length - 1; k++) {
+        if (url[k] === '(') depth++;
+        else if (url[k] === ')' && depth > 0) depth--;
+      }
+      if (depth > 0) break;
+      url = url.slice(0, -1);
+      changed = true;
     }
-    while (url.endsWith(')') && close > open) { url = url.slice(0, -1); close--; changed = true; }
     if (url.endsWith(';')) {
       const amp = url.lastIndexOf('&');
       if (amp >= 0) {
@@ -470,7 +586,11 @@ function trimExtUrl(url) {
 
 // Try to match a www./http(s):// extended autolink at text[i].
 // Returns {url, end} or null. Caller checks the preceding-char boundary.
-function matchExtUrl(text, i) {
+// `dTail`/`links` are the inline delimiter stack and link definitions: a
+// ']' only ends the URL when it closes a link (doc-10/14/19/24), otherwise
+// it is part of the URL (doc-08/12, where the '[' openers were already
+// deactivated by an inner link).
+function matchExtUrl(text, i, dTail, links) {
   const n = text.length;
   let j = i;
   if (text.startsWith('www.', i)) j = i + 4;
@@ -506,7 +626,25 @@ function matchExtUrl(text, i) {
   if (text[j] === '/' || text[j] === '?' || text[j] === '#') {
     while (j < n) {
       const c = text[j];
-      if (isWs(c) || c === '<' || c === '>') break;
+      if (isWs(c) || c === '<' || c === '>' || c === '[') break;
+      // A ']' ends the URL only when it closes a link (the link text
+      // containing the URL still closes at its ']'); when the '[' openers
+      // were deactivated, the ']' is part of the URL (doc-08/12).
+      if (c === ']') {
+        if (dTail && linkClosesAt(text, j, dTail, links)) break;
+        j++;
+        continue;
+      }
+      // Stop before '(' that starts another URL (doc-08:
+      // '...example.io)](https://npmjs.com/heading' ends the autolink
+      // before the '('; doc-12 keeps '(./docs/create.md)' because it is
+      // not a URL start).
+      if (c === '(') {
+        const rest = text.slice(j + 1, j + 9).toLowerCase();
+        if (rest.startsWith('https://') || rest.startsWith('http://') || rest.startsWith('ftp://') || rest.startsWith('www.')) break;
+        j++;
+        continue;
+      }
       j++;
     }
   }
@@ -518,7 +656,7 @@ function matchExtUrl(text, i) {
 // Match an email address ending at text[i] === '@' (bare or scheme-prefixed).
 // Returns {text, start, end, href} or null. `start` is where the autolink
 // begins in the source (scheme start, or local-part start).
-function matchEmail(text, i) {
+function matchEmail(text, i, dTail) {
   const n = text.length;
   let s = i - 1;
   while (s >= 0 && LOCAL_CHARS.indexOf(text[s]) >= 0) s--;
@@ -543,7 +681,20 @@ function matchEmail(text, i) {
     break;
   }
   if (labels < 2) return null;
-  if (text[j] === '-' || text[j] === '_') return null;
+  if (text[j] === '-') return null;
+  if (text[j] === '_') {
+    // A '_' after the domain normally kills the autolink (gfm-632:
+    // 'a.b-c_d@a.b_' is plain text). But when that '_' is the closing
+    // delimiter of an emphasis span wrapping the email (doc-25/31/34/37/38:
+    // '_warning when@atlas.example.com_', '__...table@nimbus...__'), marked
+    // matches the emphasis first, so the email links. Allow it when the
+    // nearest preceding active '_' delimiter can open; skip inert '_'s
+    // (such as the one inside a local part like 'a.b-c_d', which can
+    // neither open nor close).
+    let d = dTail;
+    while (d && (d.ch !== '_' || (!d.canOpen && !d.canClose))) d = d.dprev;
+    if (!d || !d.canOpen) return null;
+  }
   // Optional single path segment after the domain (xmpp: style).
   let end = j;
   if (text[j] === '/') {
@@ -906,6 +1057,11 @@ function inlineParse(text, links) {
   // Try to form a link/image from `opener` (a '[' delim) at the ']' at index i.
   // Returns the index to resume scanning at, or -1 when no link was formed.
   function tryLink(opener, i) {
+    // The link text must match marked's label grammar: any backtick that
+    // cannot be consumed as a code span makes the whole label invalid, so
+    // no link forms (doc-16/18/20/23: a trailing lone run after a
+    // '`` a ` b ``' code span kills the link).
+    if (!validLabel(text, opener.src + 1, i)) return -1;
     let dest = null, title = null, after = -1;
     // Inline link: ](...
     if (text[i + 1] === '(') {
@@ -1058,7 +1214,10 @@ function inlineParse(text, links) {
       let j = i;
       while (j < n && text[j] === '`') j++;
       const run = j - i;
-      // Find a matching run of exactly `run` backticks.
+      // Find a matching run of exactly `run` backticks. A code span
+      // cannot pair across a ']' that closes a link: the link text is
+      // parsed in isolation in marked, so '``url`' inside '[docs each
+      // ``url`](...)' stays literal (doc-09/28).
       let k = j;
       let found = -1;
       while (k < n) {
@@ -1067,6 +1226,8 @@ function inlineParse(text, links) {
           while (m < n && text[m] === '`') m++;
           if (m - k === run) { found = k; break; }
           k = m;
+        } else if (text[k] === ']' && linkClosesAt(text, k, dTail, links)) {
+          break;
         } else k++;
       }
       if (found >= 0) {
@@ -1198,7 +1359,7 @@ function inlineParse(text, links) {
       continue;
     }
     if (c === '@') {
-      const em = matchEmail(text, i);
+      const em = matchEmail(text, i, dTail);
       if (em) {
         // Truncate the tail back to the autolink start (the local part may
         // span text and delimiter nodes, see truncateTail).
@@ -1216,7 +1377,7 @@ function inlineParse(text, links) {
       continue;
     }
     if (c === 'w' && text.startsWith('www.', i) && (i === 0 || !isWordChar(text[i - 1]))) {
-      const u = matchExtUrl(text, i);
+      const u = matchExtUrl(text, i, dTail, links);
       if (u) {
         appendNode({ t: 'link', ext: true, href: 'http://' + u.url, title: null, first: { t: 'text', s: u.url, parent: null, next: null, prev: null }, last: null, parent: null });
         const ln = tail;
@@ -1231,7 +1392,7 @@ function inlineParse(text, links) {
     if ((c === 'h' || c === 'H') && (i === 0 || !isWordChar(text[i - 1]))) {
       const head = text.slice(i, i + 8).toLowerCase();
       if (head.startsWith('https://') || head.startsWith('http://')) {
-        const u = matchExtUrl(text, i);
+        const u = matchExtUrl(text, i, dTail, links);
         if (u) {
           appendNode({ t: 'link', ext: true, href: u.url, title: null, first: { t: 'text', s: u.url, parent: null, next: null, prev: null }, last: null, parent: null });
           const ln = tail;
@@ -1993,10 +2154,12 @@ function parseBlocks(lines, a, b, ctx) {
       } else {
         while (j < b && !isBlankLine(lines[j])) { blockLines.push(lines[j]); j++; }
       }
-      // The block carries a trailing newline only when the next line in this
-      // container is a real line, not a blank line or the end (cm-169/177 vs
-      // cm-152/183/190).
-      nodes.push({ t: 'html', text: blockLines.join('\n') + (j < b && !isBlankLine(lines[j]) ? '\n' : '') });
+      // The block carries a trailing newline when the next line in this
+      // container is a real line or a whitespace-only line, but not when it
+      // is empty or the end (doc-15: a tab-only line after '-->' still gets
+      // the newline; cm-152/183/190 have a truly empty next line and get
+      // none).
+      nodes.push({ t: 'html', text: blockLines.join('\n') + (j < b && lines[j] !== '' ? '\n' : '') });
       i = j;
       continue;
     }
