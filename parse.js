@@ -2115,7 +2115,21 @@ function parseBlocks(lines, a, b, ctx) {
       let j = i + 1;
       while (j < b) {
         if (isClosingFence(lines[j], fence.ch, fence.len)) break;
-        content.push(stripIndent(lines[j], fence.indent));
+        let c = stripIndent(lines[j], fence.indent);
+        // A tab right after the stripped fence indent expands to spaces
+        // by its original column (doc-04 occ 7: fence indent 8, tab at
+        // col 8 becomes 4 spaces). stripIndent's multiple-of-4 branch
+        // leaves such a tab untouched; a tab at column 0 (fence indent
+        // 0) is kept as-is (doc-04 occ 1/6).
+        if (fence.indent > 0) {
+          let sp = 0;
+          while (sp < c.length && c[sp] === ' ') sp++;
+          if (c[sp] === '\t') {
+            const w = 4 - ((fence.indent + sp) % 4);
+            c = c.slice(0, sp) + ' '.repeat(w) + c.slice(sp + 1);
+          }
+        }
+        content.push(c);
         j++;
       }
       // A fenced code block drops at most one trailing empty line (cm-318:
