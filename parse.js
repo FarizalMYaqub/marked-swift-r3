@@ -1909,11 +1909,18 @@ function tryTable(lines, i, b) {
   }
   const rows = [];
   let j = i + 2;
-  while (j < b && !isBlankLine(lines[j])) {
+  while (j < b) {
+    const line = lines[j];
+    // A line ends the table when it is empty or spaces-only (a blank
+    // line). A whitespace-only line that contains a tab (e.g. a lone
+    // '\t') is an all-empty row, not a terminator (doc-02/05/26/33: the
+    // expected output has an extra row of empty cells there, and the
+    // following text line is a further row).
+    if (line === '' || (line.trim() === '' && line.indexOf('\t') < 0)) break;
     // A line that starts a new block (blockquote, heading, list, ...) ends
     // the table (gfm-201: '> bar' is a blockquote, not a row).
-    if (canInterruptParagraph(lines[j])) break;
-    rows.push(splitTableRow(lines[j]));
+    if (canInterruptParagraph(line)) break;
+    rows.push(splitTableRow(line));
     j++;
   }
   return { node: { t: 'table', align, header: headerCells, rows }, next: j };
